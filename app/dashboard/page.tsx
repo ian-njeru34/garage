@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useEffect, useState } from "react";
@@ -25,6 +26,9 @@ type QuoteRequest = {
   budget: string | number | null;
   status: string;
   created_at: string;
+  quoted_price: number | null;
+  quote_details: string | null;
+  decision: "pending" | "approved" | "declined";
 };
 
 function formatStatus(status: string) {
@@ -39,87 +43,160 @@ function formatDate(date: string) {
   });
 }
 
+function formatMoney(amount: number) {
+  return new Intl.NumberFormat("en-KE", {
+    style: "currency",
+    currency: "KES",
+    maximumFractionDigits: 2,
+  }).format(amount);
+}
+
 export default function DashboardPage() {
   const [email, setEmail] = useState("");
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [quotes, setQuotes] = useState<QuoteRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState("");
+  const [savingQuote, setSavingQuote] = useState<string | null>(null);
   const router = useRouter();
+
+  async function loadDashboard() {
+    if (!supabaseConfigured) {
+      setMsg("Supabase is not configured yet.");
+      setLoading(false);
+      return;
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser();
+
+    if (userError || !user) {
+      router.replace("/login");
+      return;
+    }
+
+    setEmail(user.email || "");
+
+    const [bookingResult, quoteResult] = await Promise.all([
+      supabase
+        .from("bookings")
+        .select(
+          "id,service_name,vehicle_registration,preferred_date,status,created_at"
+        )
+        .eq("customer_id", user.id)
+        .order("created_at", { ascending: false }),
+
+      supabase
+        .from("quote_requests")
+        .select(
+          "id,customer_name,vehicle_registration,vehicle_make_model,service_name,description,budget,status,created_at,quoted_price,quote_details,decision"
+        )
+        .eq("customer_id", user.id)
+        .order("created_at", { ascending: false }),
+    ]);
+
+    if (bookingResult.error) {
+      setMsg(`Bookings: ${bookingResult.error.message}`);
+    } else {
+      setBookings((bookingResult.data || []) as Booking[]);
+    }
+
+    if (quoteResult.error) {
+      setMsg((previous) =>
+        previous
+          ? `${previous} | Quotations: ${quoteResult.error.message}`
+          : `Quotations: ${quoteResult.error.message}`
+      );
+    } else {
+      setQuotes((quoteResult.data || []) as QuoteRequest[]);
+    }
+
+    setLoading(false);
+  }
 
   useEffect(() => {
     let active = true;
 
-    async function loadDashboard() {
-      if (!supabaseConfigured) {
-        setMsg("Supabase is not configured yet. Follow the README.");
-        setLoading(false);
-        return;
-      }
-
-      const {
-        data: { user },
-        error: userError,
-      } = await supabase.auth.getUser();
-
-      if (userError || !user) {
-        router.replace("/login");
-        return;
-      }
-
+    async function load() {
+      await loadDashboard();
       if (!active) return;
-      setEmail(user.email || "");
-
-      const [bookingResult, quoteResult] = await Promise.all([
-        supabase
-          .from("bookings")
-          .select(
-            "id,service_name,vehicle_registration,preferred_date,status,created_at"
-          )
-          .eq("customer_id", user.id)
-          .order("created_at", { ascending: false }),
-
-        supabase
-          .from("quote_requests")
-          .select(
-            "id,customer_name,vehicle_registration,vehicle_make_model,service_name,description,budget,status,created_at"
-          )
-          .eq("customer_id", user.id)
-          .order("created_at", { ascending: false }),
-      ]);
-
-      if (!active) return;
-
-      if (bookingResult.error) {
-        setMsg(`Bookings: ${bookingResult.error.message}`);
-      } else {
-        setBookings((bookingResult.data || []) as Booking[]);
-      }
-
-      if (quoteResult.error) {
-        setMsg((previous) =>
-          previous
-            ? `${previous} | Quotations: ${quoteResult.error.message}`
-            : `Quotations: ${quoteResult.error.message}`
-        );
-      } else {
-        setQuotes((quoteResult.data || []) as QuoteRequest[]);
-      }
-
-      setLoading(false);
     }
 
-    loadDashboard();
+    load();
 
     return () => {
       active = false;
     };
-  }, [router]);
+  }, []);
 
   async function logout() {
     await supabase.auth.signOut();
     router.push("/");
     router.refresh();
+  }
+
+  async function decideQuote(
+    quoteId: string,
+    decision: "approved" | "declined"
+  ) {
+    const confirmed = window.confirm(
+      decision === "approved"
+        ? "Approve this quotation? This confirms your acceptance of the quoted price and repair details."
+        : "Decline this quotation?"
+    );
+
+    if (!confirmed) return;
+
+    setSavingQuote(quoteId);
+    setMsg("");
+
+    const { data: userData, error: userError } =
+      await supabase.auth.getUser();
+
+    if (userError || !userData.user) {
+      setMsg("Your session has expired. Please sign in again.");
+      setSavingQuote(null);
+      router.replace("/login");
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("quote_requests")
+      .update({
+        decision,
+        decided_at: new Date().toISOString(),
+      })
+      .eq("id", quoteId)
+      .eq("customer_id", userData.user.id)
+      .eq("decision", "pending")
+      .select("id,decision")
+      .maybeSingle();
+
+    if (error) {
+      setMsg(`Could not save your decision: ${error.message}`);
+    } else if (!data) {
+      setMsg(
+        "Your decision was not saved. The quotation may already have been decided, or your account may not have permission to update it. Refresh the page and try again."
+      );
+      await loadDashboard();
+    } else {
+      setQuotes((previous) =>
+        previous.map((quote) =>
+          quote.id === quoteId
+            ? { ...quote, decision }
+            : quote
+        )
+      );
+      setMsg(
+        decision === "approved"
+          ? "Quotation approved successfully."
+          : "Quotation declined successfully."
+      );
+    }
+
+    setSavingQuote(null);
   }
 
   const pendingBookings = bookings.filter((booking) =>
@@ -142,9 +219,7 @@ export default function DashboardPage() {
       <section className="section soft">
         <div className="shell dashboard-grid">
           <aside className="side-menu">
-            <Link className="active" href="/dashboard">
-              Overview
-            </Link>
+            <Link className="active" href="/dashboard">Overview</Link>
             <Link href="/booking">Book a service</Link>
             <Link href="/quote">Request a quote</Link>
             <button
@@ -186,7 +261,7 @@ export default function DashboardPage() {
               </div>
             </div>
 
-            {msg && <p className="error">{msg}</p>}
+            {msg && <p className="notice" role="status">{msg}</p>}
 
             <h2 style={{ fontFamily: "Montserrat", marginTop: 28 }}>
               Service Bookings
@@ -206,12 +281,8 @@ export default function DashboardPage() {
                   {bookings.map((booking) => (
                     <tr key={booking.id}>
                       <td>{booking.service_name}</td>
-                      <td>
-                        {booking.vehicle_registration || "Not provided"}
-                      </td>
-                      <td>
-                        {booking.preferred_date || "To be arranged"}
-                      </td>
+                      <td>{booking.vehicle_registration || "Not provided"}</td>
+                      <td>{booking.preferred_date || "To be arranged"}</td>
                       <td>
                         <span className="pill">
                           {formatStatus(booking.status)}
@@ -251,7 +322,7 @@ export default function DashboardPage() {
               </Link>
             </div>
 
-            {quotes.length === 0 && !loading ? (
+            {!loading && quotes.length === 0 ? (
               <div className="empty">
                 No quotation requests found for your account.
               </div>
@@ -260,11 +331,10 @@ export default function DashboardPage() {
                 <table>
                   <thead>
                     <tr>
-                      <th>Service</th>
+                      <th>Service / request</th>
                       <th>Vehicle</th>
-                      <th>Description</th>
                       <th>Submitted</th>
-                      <th>Status</th>
+                      <th>Request status</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -272,11 +342,14 @@ export default function DashboardPage() {
                       <tr key={quote.id}>
                         <td>{quote.service_name || "General enquiry"}</td>
                         <td>
-                          {quote.vehicle_registration ||
-                            quote.vehicle_make_model ||
-                            "Not provided"}
+                          {quote.vehicle_registration || "Not provided"}
+                          {quote.vehicle_make_model && (
+                            <>
+                              <br />
+                              {quote.vehicle_make_model}
+                            </>
+                          )}
                         </td>
-                        <td>{quote.description || "—"}</td>
                         <td>{formatDate(quote.created_at)}</td>
                         <td>
                           <span className="pill">
@@ -290,14 +363,105 @@ export default function DashboardPage() {
               </div>
             )}
 
-            {loading && (
-              <div className="empty">Loading your requests…</div>
-            )}
+            <h2 style={{ fontFamily: "Montserrat", marginTop: 32 }}>
+              Your Quotations
+            </h2>
+            <p style={{ color: "var(--muted)", fontSize: 13 }}>
+              Review the proposed work and price before making a decision.
+              Approving a quotation records your acceptance; contact the garage
+              if you need clarification.
+            </p>
+
+            {quotes.map((quote) => (
+              <article
+                key={`quotation-${quote.id}`}
+                className="service-card"
+                style={{ marginBottom: 16 }}
+              >
+                <h3>{quote.service_name || "Vehicle repair quotation"}</h3>
+                <p>
+                  <strong>Vehicle:</strong>{" "}
+                  {quote.vehicle_registration || "Not provided"}
+                  {quote.vehicle_make_model
+                    ? ` — ${quote.vehicle_make_model}`
+                    : ""}
+                </p>
+                <p>
+                  <strong>Your request:</strong>{" "}
+                  {quote.description || "No description supplied"}
+                </p>
+
+                {quote.quoted_price !== null ? (
+                  <p style={{ fontSize: 22, fontWeight: 700 }}>
+                    Quoted price: {formatMoney(Number(quote.quoted_price))}
+                  </p>
+                ) : (
+                  <p>The garage has not provided a price yet.</p>
+                )}
+
+                {quote.quote_details && (
+                  <div>
+                    <strong>Proposed repairs and terms</strong>
+                    <p style={{ whiteSpace: "pre-wrap" }}>
+                      {quote.quote_details}
+                    </p>
+                  </div>
+                )}
+
+                <p>
+                  <strong>Decision:</strong>{" "}
+                  {formatStatus(quote.decision || "pending")}
+                </p>
+
+                {quote.quoted_price !== null &&
+                  quote.quote_details?.trim() &&
+                  quote.decision === "pending" && (
+                    <div
+                      className="actions"
+                      style={{ marginTop: 16, flexWrap: "wrap" }}
+                    >
+                      <button
+                        className="btn"
+                        disabled={savingQuote === quote.id}
+                        onClick={() => decideQuote(quote.id, "approved")}
+                      >
+                        {savingQuote === quote.id
+                          ? "Saving…"
+                          : "Approve quotation"}
+                      </button>
+                      <button
+                        className="btn outline"
+                        disabled={savingQuote === quote.id}
+                        onClick={() => decideQuote(quote.id, "declined")}
+                      >
+                        Decline quotation
+                      </button>
+                    </div>
+                  )}
+
+                {quote.decision !== "pending" && (
+                  <p className="notice">
+                    You have {quote.decision} this quotation. Contact the
+                    garage if you need to discuss a change.
+                  </p>
+                )}
+
+                {quote.quoted_price !== null &&
+                  !quote.quote_details?.trim() &&
+                  quote.decision === "pending" && (
+                    <p className="notice">
+                      The garage is preparing the repair details. You can
+                      respond once the complete quotation is available.
+                    </p>
+                  )}
+              </article>
+            ))}
+
+            {loading && <div className="empty">Loading your requests…</div>}
 
             <div className="notice" style={{ marginTop: 20 }}>
-              Your dashboard shows your service bookings and quotation
-              requests. Job tracking, quote approvals, invoices and payments
-              can be added as the next stage.
+              A quotation approval records your decision. Do not begin repairs
+              until the garage confirms the next steps.
             </div>
           </div>
         </div>
